@@ -5,6 +5,7 @@
 #include <iterator>
 #include <map>
 #include <string>
+#include <vector>
 
 // the game's own settings, in the settings file through app::kGame.options
 namespace game {
@@ -60,6 +61,15 @@ struct Options {
     bool skip_cutscenes = false;  // cheat: any cinematic and film can be skipped, seen or not, src/game/cheats.cpp
     bool unlock_extras = false;  // cheat: every unlockable of the Kontent menu (art, films, costumes, arenas)
     bool ps2_buttons = false;  // the touch controls and the game's button prompts show the PS2's buttons
+    // netplay (native/netplay.cpp), the settings file's own keys; the panel's NETPLAY page edits the first four
+    std::string netplay_address;  // the host a guest joins: an IPv4 address or name, "address:port" for another port
+    uint32_t netplay_port = 7777;
+    uint32_t netplay_delay = 3;  // frames both phones wait on input, 1 to 12; the host's is the session's
+    bool netplay_copy_save = true;  // the host's saves are copied over the guest's when it joins (its own are kept)
+    // guest memory as "ADDRESS:LENGTH": the first list is copied from the host to the guest at each barrier (an RNG's
+    // state), the second is what the state hash covers (none: the image's data and bss)
+    std::vector<std::string> netplay_sync;
+    std::vector<std::string> netplay_hash;
     std::map<std::string, std::string> keys;  // action id to key names, absent is the default
     std::map<std::string, std::string> pad;   // action id to a controller's input, absent is SDL's mapping
 };

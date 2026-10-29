@@ -40,9 +40,6 @@ uint32_t ConsoleLanguage() {
 // same way, so the world keeps its speed and the frame rate drops instead. With FRAME SKIP off the game's own
 // choice stands: slow motion under 60, as the console had it.
 void FrameSkip(X86Context&, uint8_t*) {
-    // netplay first: it may wait for the friend's pad. The skip below still follows this phone's clock, so a phone that
-    // cannot hold 60 draws fewer frames instead of slowing the pair down; it only skips drawing, the game steps the same.
-    netplay::Step();
     using clock = std::chrono::steady_clock;
     constexpr uint32_t kSkipDraw = 0x5CAB98;
     constexpr auto kStep = std::chrono::microseconds(16667);
@@ -52,14 +49,24 @@ void FrameSkip(X86Context&, uint8_t*) {
     static clock::time_point due;
     static int skips = 0;
     auto now = clock::now();
-    if (!game::Opt().frame_skip) {
+    const bool on = game::Opt().frame_skip;
+    bool late = false;
+    if (on) {
+        // ahead of the clock carries no credit: the pacing at the present keeps 60
+        if (due > now || now - due > kMaxLag) due = now;
+        late = now - due >= kStep && skips < kMaxSkips;
+    } else {
         due = now;  // turned on again, it starts from here
         skips = 0;
-        return;
     }
-    // ahead of the clock carries no credit: the pacing at the present keeps 60
-    if (due > now || now - due > kMaxLag) due = now;
-    if (now - due >= kStep && skips < kMaxSkips) kernel::W32(kSkipDraw, 1);
+    // netplay first: it may wait for the friend's pad. A phone that is behind says so in its pad and both skip the same
+    // frames, because drawing may draw from the game's random numbers and the two games must make the same draws
+    netplay::SetSkipWant(late);
+    netplay::Step();
+    const int shared = netplay::SkipThisFrame();
+    if (shared >= 0) late = shared != 0;
+    else if (!on) return;
+    if (late) kernel::W32(kSkipDraw, 1);
     skips = kernel::R32(kSkipDraw) ? skips + 1 : 0;
     due += kStep;
 }

@@ -1,15 +1,3 @@
-// Loopback test of native/netplay.cpp, no phone or game needed (Linux or WSL): two processes, each a fake game thread
-// calling netplay::Step() once a frame with a scripted pad, with packet loss, a leave from gameplay and a forced desync.
-//
-//   g++ -std=c++20 -O1 -pthread -Inative -Inative/compat -Isrc -Isdk/runtime -Isdk/harness/compat \
-//       tools/netplay_loopback_test.cpp -o /tmp/np_test
-//   mkdir -p /tmp/np/h/hdd /tmp/np/g/hdd
-//   /tmp/np_test h /tmp/np/h 47001 0.1 600 1 > h.out 2> h.err &   # role, folder, port, loss (0 to 1), frames, mode
-//   /tmp/np_test g /tmp/np/g 47001 0.1 600 1 > g.out 2> g.err
-//
-// Mode 0 plays on, 1 has the guest leave gameplay for 1.8 s (a new epoch), 2 has it stall 3 s in the background (the
-// same epoch goes on). Each line of the .out files is one frame: its number, port 0's buttons, left stick x and A, then
-// port 1's. Both files must hold the same pads for the same frames of an epoch; the .err files have the log.
 // two processes on loopback, each a fake game thread that calls netplay::Step() once a frame
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -92,6 +80,7 @@ int main(int argc, char** argv) {
     game::Opt().netplay_hash = {"0x100000:16"};
     kernel::g_base = static_cast<uint8_t*>(mmap(nullptr, 0x04000000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0));
     if (g_host_side) std::memcpy(kernel::HostPtr(0x100000), "HOSTRNGSTATE0123", 16);
+    *static_cast<uint32_t*>(kernel::HostPtr(0x2000010)) = g_host_side ? 12345u : 99999u;  // a C runtime rand state, seeded apart
     if (g_host_side) netplay::Host();
     else {
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
@@ -101,6 +90,9 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     std::this_thread::sleep_for(std::chrono::milliseconds(1500));  // the save copy
     std::fprintf(stderr, "[%s] status: %s\n", std::getenv("NP_ROLE"), netplay::Status().c_str());
+    g_tick = 0;
+    { input::Pad a = input::Poll(0), b = input::Poll(1); std::this_thread::sleep_for(std::chrono::milliseconds(100)); a = input::Poll(0); b = input::Poll(1);
+      std::fprintf(stderr, "[%s] menu phase: port0 %03x port1 %03x\n", std::getenv("NP_ROLE"), a.buttons, b.buttons); }
     for (int i = 0; i < frames; i++) {
         g_tick = uint32_t(i);
         if (gap == 2 && !g_host_side && i == 200) {
@@ -114,10 +106,22 @@ int main(int argc, char** argv) {
         }
         if (i == 450 && !g_host_side) static_cast<uint8_t*>(kernel::HostPtr(0x100000))[3] ^= 0xFF;  // the games part here
         netplay::Step();
+        {   // the fake game draws from its generator a few times a frame, and keeps a counter and a clock-like word
+            uint32_t* rng = static_cast<uint32_t*>(kernel::HostPtr(0x2000010));
+            for (int k = 0; k < int(i % 4) + 1; k++) *rng = *rng * 214013u + 2531011u;
+            (*static_cast<uint32_t*>(kernel::HostPtr(0x500100)))++;
+            *static_cast<uint32_t*>(kernel::HostPtr(0x500200)) = uint32_t(i) * 2654435761u + (g_host_side ? 0u : 7u);
+        }
+        if (std::getenv("NP_NOISE")) {  // a million words that change every frame, like buffers of a real game
+            uint32_t* n = static_cast<uint32_t*>(kernel::HostPtr(0x1000000));
+            uint32_t v = uint32_t(i) * 2246822519u + (g_host_side ? 1u : 2u);
+            for (int k = 0; k < 1000000; k++) { v ^= v << 13; v ^= v >> 17; v ^= v << 5; n[k] = v; }
+        }
         input::Pad p0 = input::Poll(0), p1 = input::Poll(1);
         std::printf("%d %03x %d %02x | %03x %d %02x\n", i, p0.buttons, p0.lx, p0.analog[0], p1.buttons, p1.lx, p1.analog[0]);
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
     }
+    std::fprintf(stderr, "[%s] rng word at the end: %08x\n", std::getenv("NP_ROLE"), *static_cast<uint32_t*>(kernel::HostPtr(0x2000010)));
     std::fprintf(stderr, "[%s] end: %s, rng bytes \"%.16s\", in sync %d\n", std::getenv("NP_ROLE"), netplay::Status().c_str(),
                  reinterpret_cast<char*>(kernel::HostPtr(0x100000)), int(netplay::InSync()));
     netplay::Stop();

@@ -31,6 +31,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <random>
 #include <string>
@@ -52,7 +53,7 @@ namespace fs = std::filesystem;
 
 constexpr uint32_t kMagic = 0x504E4D53;      // "SMNP"
 constexpr uint32_t kSaveMagic = 0x56534D53;  // "SMSV"
-constexpr uint8_t kVersion = 2;
+constexpr uint8_t kVersion = 3;
 enum Type : uint8_t { kHello = 1, kWelcome, kInput, kSync, kPing, kPong, kBye, kPad };
 
 constexpr uint32_t kRing = 1024;      // frames kept, far more than the delay and the retransmit window
@@ -64,10 +65,16 @@ constexpr int kDeadMs = 6000;         // no packet for this long: the link is go
 constexpr size_t kPayloadMax = 1100;  // the barrier's guest memory, in one packet
 constexpr size_t kStateMax = 600;     // the same riding on an input packet
 constexpr uint32_t kStateEvery = 60;  // frames between two copies of the host's state words to the guest
-// the host looks for the game's random number generator in the image's data: three snapshots kScanGap frames apart,
-// from frame kScanFirst, again kScanRepeat frames on while none was found
-constexpr uint32_t kScanLo = 0x3F0000, kScanHi = 0x5CB000, kScanGap = 20, kScanFirst = 240, kScanRepeat = 600;
-constexpr uint32_t kScanSteps = 20000, kScanRounds = 6;
+// the host looks for the game's random number generator in all of the console's memory (the C runtime keeps its state
+// per thread, on the heap): three snapshots kScanGap frames apart, from frame kScanFirst of an epoch, again kScanRepeat
+// frames on while none was found
+constexpr uint32_t kScanGap = 20, kScanFirst = 240, kScanRepeat = 600;
+constexpr uint32_t kImageLo = 0x3F0000, kImageHi = 0x5CB000;  // the image's data and bss, for the scan's report
+constexpr uint32_t kScanSteps = 5000;   // steps of the generators that are walked one by one
+constexpr uint32_t kScanRounds = 4;     // per epoch
+constexpr uint32_t kLcgBits = 17;       // an LCG's low bits cycle on their own: the steps between two looks, up to 2^17
+constexpr uint32_t kVerifySteps = 200000;  // between two copies of a state word
+constexpr uint8_t kNoGen = 0xFF;
 // guest memory the hash covers without any setting: the image's data and bss, up to the page of 0x5CAB98
 constexpr uint32_t kHashLo = 0x4A0000, kHashHi = 0x5CB000;
 constexpr uint32_t kGuestLo = 0x10000, kGuestEnd = 0x04000000;  // what a setting may name: the console's 64 MB
@@ -78,12 +85,16 @@ struct WirePad {
     uint16_t buttons;
     uint8_t analog[8];
     int16_t stick[4];
+    uint8_t flags;  // bit 0: this phone's frame skip wants this frame's drawing skipped
 };
 #pragma pack(pop)
-static_assert(sizeof(WirePad) == 18);
+static_assert(sizeof(WirePad) == 19);
 
 struct Region {
     uint32_t addr, len;
+    uint8_t gen = kNoGen;  // an index into kGens for a word the scan found, else a setting's region
+    uint32_t last = 0;     // host: the word as last sent
+    bool seen = false;
 };
 
 struct Writer {
@@ -183,6 +194,18 @@ std::vector<uint8_t> g_snap[3];
 int g_snap_n = 0;
 uint32_t g_scan_round = 0;
 bool g_scan_busy = false;
+// the guest's: a state word is only written once it was seen to move along its generator on this phone too, so a word
+// of another meaning at that address (the two heaps differ) is left alone
+struct GuestWord {
+    uint32_t last = 0;
+    bool verified = false;
+};
+std::map<uint32_t, GuestWord> g_gw;
+uint64_t g_stat_unverified = 0;
+
+// frame skip, the same on both phones: each says in its pad whether it is late, the frame is skipped if either is
+std::atomic<bool> g_skip_want{false};
+std::atomic<int> g_skip_now{-1};  // -1 outside lockstep
 
 std::mutex g_latch;
 input::Pad g_raw;               // the phone's own port 0, as Filter last saw it
@@ -764,48 +787,6 @@ std::string LocalAddresses() {
     return out;
 }
 
-// under g_mtx, game thread: the guest memory the host chose, in the payload
-// the host's state words as bytes: a count, then address, length and contents of each region
-std::vector<uint8_t> MakePayload(size_t max) {
-    Writer w;
-    std::vector<Region> list = Regions(game::Opt().netplay_sync);
-    list.insert(list.end(), g_auto.begin(), g_auto.end());
-    w.u8(0);
-    uint8_t n = 0;
-    for (const Region& r : list) {
-        if (w.b.size() + 8 + r.len > max) {
-            LOGR("netplay: sync region %06x+%u does not fit one packet, skipped", r.addr, r.len);
-            continue;
-        }
-        w.u32(r.addr);
-        w.u32(r.len);
-        w.raw(kernel::HostPtr(r.addr), r.len);
-        n++;
-    }
-    w.b[0] = n;
-    return std::move(w.b);
-}
-
-// writes them into the guest's memory; how many words of it changed
-uint32_t ApplyBytes(const std::vector<uint8_t>& bytes) {
-    Reader r{bytes.data(), bytes.size()};
-    uint8_t n = r.u8();
-    uint32_t changed = 0;
-    for (uint8_t i = 0; r.ok && i < n; i++) {
-        uint32_t addr = r.u32(), len = r.u32();
-        if (!r.ok || len > r.n || addr < kGuestLo || uint64_t(addr) + len > kGuestEnd) break;
-        if (std::memcmp(kernel::HostPtr(addr), r.p, len) != 0) changed++;
-        std::memcpy(kernel::HostPtr(addr), r.p, len);
-        r.p += len;
-        r.n -= len;
-    }
-    return changed;
-}
-
-void BuildPayload() { g_payload = MakePayload(kPayloadMax); }
-
-void ApplyPayload() { ApplyBytes(g_payload); }
-
 // ---- the random number generator scan (host). A generator's state is a word that, between two looks, has moved
 // some steps along a fixed recurrence. Three looks that fit one recurrence leave no doubt, so the scan is not a guess
 // at what the game does with the word, only at which words are the generator's.
@@ -826,62 +807,168 @@ uint32_t ParkMiller(uint32_t x) {
 struct Gen {
     const char* name;
     uint32_t (*step)(uint32_t);
+    uint32_t a, c;  // an LCG's (checked in the scan the quick way), else 0
 };
-constexpr Gen kGens[] = {{"lcg 214013 2531011 (the C runtime's rand)", Lcg<214013, 2531011>},
-                         {"lcg 1664525 1013904223", Lcg<1664525, 1013904223>},
-                         {"lcg 69069 1", Lcg<69069, 1>},
-                         {"lcg 1103515245 12345", Lcg<1103515245, 12345>},
-                         {"lcg 134775813 1", Lcg<134775813, 1>},
-                         {"lcg 22695477 1", Lcg<22695477, 1>},
-                         {"xorshift32", XorShift32},
-                         {"park-miller 16807", ParkMiller<16807>},
-                         {"park-miller 48271", ParkMiller<48271>}};
+constexpr Gen kGens[] = {{"lcg 214013 2531011 (the C runtime's rand)", Lcg<214013, 2531011>, 214013, 2531011},
+                         {"lcg 1664525 1013904223", Lcg<1664525, 1013904223>, 1664525, 1013904223},
+                         {"lcg 69069 1", Lcg<69069, 1>, 69069, 1},
+                         {"lcg 1103515245 12345", Lcg<1103515245, 12345>, 1103515245, 12345},
+                         {"lcg 134775813 1", Lcg<134775813, 1>, 134775813, 1},
+                         {"lcg 22695477 1", Lcg<22695477, 1>, 22695477, 1},
+                         {"xorshift32", XorShift32, 0, 0},
+                         {"park-miller 16807", ParkMiller<16807>, 0, 0},
+                         {"park-miller 48271", ParkMiller<48271>, 0, 0}};
+constexpr size_t kGenCount = sizeof kGens / sizeof kGens[0];
 
-bool Reaches(uint32_t (*step)(uint32_t), uint32_t from, uint32_t to) {
-    for (uint32_t k = 0; k < kScanSteps; k++) {
+// walks the generator from one word to the next, up to max steps
+bool Reaches(uint32_t (*step)(uint32_t), uint32_t from, uint32_t to, uint32_t max) {
+    for (uint32_t k = 0; k < max; k++) {
         from = step(from);
         if (from == to) return true;
     }
     return false;
 }
 
-void ScanThread(uint32_t gen, std::vector<uint8_t> a, std::vector<uint8_t> b, std::vector<uint8_t> c) {
+// a word the generator `gen` could have moved to `to` from `from` (or left alone)
+bool Plausible(uint8_t gen, uint32_t from, uint32_t to) {
+    return from == to || (gen < kGenCount && Reaches(kGens[gen].step, from, to, kVerifySteps));
+}
+
+// An LCG mod 2^32 with an odd increment and a multiplier of 1 mod 4 has the full period, and its low kLcgBits bits
+// are the same LCG mod 2^kLcgBits, one cycle through every value: so the position of a word in that cycle, taken
+// from a table, gives the steps between two words mod 2^kLcgBits without walking, and one run of the real recurrence
+// (by squaring) checks it.
+struct LcgTable {
+    std::vector<uint32_t> pos;
+    bool ok = false;
+};
+
+void BuildTable(const Gen& g, LcgTable& t) {
+    const uint32_t size = 1u << kLcgBits, mask = size - 1;
+    t.pos.assign(size, 0);
+    uint32_t s = 0;
+    for (uint32_t i = 0; i < size; i++) {
+        t.pos[s] = i;
+        s = (s * g.a + g.c) & mask;
+    }
+    t.ok = s == 0;  // back at the start after exactly one cycle
+}
+
+// x -> y in at most 2^kLcgBits steps
+bool LcgReaches(const Gen& g, const LcgTable& t, uint32_t x, uint32_t y) {
+    const uint32_t mask = (1u << kLcgBits) - 1;
+    uint32_t n = (t.pos[y & mask] - t.pos[x & mask]) & mask;
+    if (n == 0) n = mask + 1;
+    uint32_t ra = 1, rc = 0, ba = g.a, bc = g.c;  // the map x -> ra * x + rc, and the one stepped by squaring
+    for (uint32_t k = n; k; k >>= 1) {
+        if (k & 1) {
+            rc = ba * rc + bc;
+            ra = ba * ra;
+        }
+        bc = ba * bc + bc;
+        ba = ba * ba;
+    }
+    return ra * x + rc == y;
+}
+
+struct ScanResult {
     std::vector<Region> found;
-    uint32_t changed = 0;
-    for (size_t i = 0; i + 4 <= a.size() && found.size() < 8; i += 4) {
+    uint64_t moved = 0, moved_image = 0;
+    std::vector<std::array<uint32_t, 4>> samples;  // address and three looks, of the image's data
+};
+
+// the words of [first, last) of three looks, for the workers
+void ScanRange(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b, const std::vector<uint8_t>& c, size_t first,
+               size_t last, const LcgTable* tables, bool walk, std::chrono::steady_clock::time_point deadline,
+               std::mutex& out_mtx, ScanResult& out) {
+    ScanResult mine;
+    uint32_t tick = 0;
+    bool expired = false;
+    for (size_t i = first; i + 4 <= last; i += 4) {
         uint32_t x, y, z;
         std::memcpy(&x, &a[i], 4);
         std::memcpy(&y, &b[i], 4);
         std::memcpy(&z, &c[i], 4);
         if (x == y || y == z) continue;
-        changed++;
-        for (const Gen& g : kGens) {
-            if (!Reaches(g.step, x, y) || !Reaches(g.step, y, z)) continue;
-            uint32_t addr = kScanLo + uint32_t(i);
-            LOGR("netplay: random number generator found at %06x (%s): %08x, %08x, %08x", addr, g.name, x, y, z);
-            found.push_back({addr, 4});
-            break;
+        if (!expired && (++tick & 255) == 0 && std::chrono::steady_clock::now() >= deadline) expired = true;
+        const uint32_t addr = kGuestLo + uint32_t(i);
+        const bool image = addr >= kImageLo && addr < kImageHi;
+        int hit = -1;
+        for (size_t g = 0; g < kGenCount && hit < 0; g++) {
+            const Gen& gen = kGens[g];
+            if (gen.a) {
+                if (!walk && tables[g].ok && LcgReaches(gen, tables[g], x, y) && LcgReaches(gen, tables[g], y, z)) hit = int(g);
+            } else if (walk && !expired) {
+                // walked one by one; the park-miller states are nonzero 31 bit words
+                if (gen.step != XorShift32 && ((x | y | z) >> 31 || !x || !y || !z)) continue;
+                if (Reaches(gen.step, x, y, kScanSteps) && Reaches(gen.step, y, z, kScanSteps)) hit = int(g);
+            }
+        }
+        if (!walk) {
+            mine.moved++;
+            if (image) {
+                mine.moved_image++;
+                if (mine.moved_image % 16 == 1 && mine.samples.size() < 14) mine.samples.push_back({addr, x, y, z});
+            }
+        }
+        if (hit >= 0 && mine.found.size() < 8) {
+            LOGR("netplay: random number generator found at %06x (%s): %08x, %08x, %08x", addr, kGens[hit].name, x, y, z);
+            Region r{addr, 4};
+            r.gen = uint8_t(hit);
+            mine.found.push_back(r);
         }
     }
-    LOGR("netplay: scan of the image's data: %u words moved in both intervals, %u generator(s) found", changed,
-         unsigned(found.size()));
+    std::lock_guard lock(out_mtx);
+    out.moved += mine.moved;
+    out.moved_image += mine.moved_image;
+    for (const auto& s : mine.samples) out.samples.push_back(s);
+    for (const Region& r : mine.found)
+        if (out.found.size() < 8) out.found.push_back(r);
+}
+
+void ScanThread(uint32_t gen, std::vector<uint8_t> a, std::vector<uint8_t> b, std::vector<uint8_t> c) {
+    static std::vector<LcgTable> tables;
+    static std::once_flag built;
+    std::call_once(built, [] {
+        tables.resize(kGenCount);
+        for (size_t g = 0; g < kGenCount; g++)
+            if (kGens[g].a) BuildTable(kGens[g], tables[g]);
+    });
+    ScanResult out;
+    std::mutex out_mtx;
+    const unsigned workers = 3;
+    const size_t span = (a.size() / 4 / workers + 1) * 4;
+    // the LCGs first, which is quick; the others are walked step by step, only if those found nothing, and for a while
+    for (bool walk : {false, true}) {
+        if (walk && !out.found.empty()) break;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+        std::vector<std::thread> pool;
+        for (unsigned w = 0; w < workers; w++)
+            pool.emplace_back([&, w] {
+                ScanRange(a, b, c, w * span, std::min(a.size(), (w + 1) * span), tables.data(), walk, deadline, out_mtx, out);
+            });
+        for (std::thread& t : pool) t.join();
+    }
+    LOGR("netplay: scan of the console's memory: %llu words moved in both intervals (%llu in the image's data), %u generator(s) found",
+         static_cast<unsigned long long>(out.moved), static_cast<unsigned long long>(out.moved_image), unsigned(out.found.size()));
+    if (out.found.empty()) {
+        // for finding the game's generator by hand: some of the image's words that moved, with their three looks
+        for (const auto& s : out.samples) LOGR("netplay: moved word %06x: %08x %08x %08x", s[0], s[1], s[2], s[3]);
+    }
     std::lock_guard lock(g_mtx);
     g_scan_busy = false;
     if (g_gen.load() != gen || g_state.load() == State::Off) return;
-    for (const Region& r : found) g_auto.push_back(r);
-    if (!found.empty()) g_scan_round = kScanRounds;  // done
+    for (const Region& r : out.found) g_auto.push_back(r);
 }
 
-// under g_mtx, host, at the start of gameplay frame f
+// under g_mtx, host, at the start of gameplay frame f of the epoch
 void MaybeScan(uint32_t f) {
-    if (!game::Opt().netplay_auto_rng || g_scan_busy || g_scan_round >= kScanRounds) return;
+    if (!game::Opt().netplay_auto_rng || g_scan_busy || !g_auto.empty() || g_scan_round >= kScanRounds) return;
     uint32_t base = kScanFirst + g_scan_round * kScanRepeat;
     int which = f == base ? 0 : f == base + kScanGap ? 1 : f == base + 2 * kScanGap ? 2 : -1;
-    if (which < 0 || which != g_snap_n) {
-        if (which != 0) return;
-    }
-    const uint8_t* mem = static_cast<const uint8_t*>(kernel::HostPtr(kScanLo));
-    g_snap[which].assign(mem, mem + (kScanHi - kScanLo));
+    if (which < 0 || which != g_snap_n) return;
+    const uint8_t* mem = static_cast<const uint8_t*>(kernel::HostPtr(kGuestLo));
+    g_snap[which].assign(mem, mem + (kGuestEnd - kGuestLo));
     g_snap_n = which + 1;
     if (which < 2) return;
     g_snap_n = 0;
@@ -889,6 +976,100 @@ void MaybeScan(uint32_t f) {
     g_scan_round++;
     std::thread(ScanThread, g_gen.load(), std::move(g_snap[0]), std::move(g_snap[1]), std::move(g_snap[2])).detach();
 }
+
+// under g_mtx, game thread: the guest memory the host chose, in the payload: a count, then address, length,
+// generator and contents of each region
+std::vector<uint8_t> MakePayload(size_t max) {
+    Writer w;
+    // a found word that no longer moves along its generator is not one any more (a level was unloaded): dropped
+    for (size_t i = 0; i < g_auto.size();) {
+        Region& r = g_auto[i];
+        uint32_t v;
+        std::memcpy(&v, kernel::HostPtr(r.addr), 4);
+        if (r.seen && !Plausible(r.gen, r.last, v)) {
+            LOGR("netplay: the word at %06x no longer moves like a generator, dropped", r.addr);
+            g_auto.erase(g_auto.begin() + long(i));
+            continue;
+        }
+        r.last = v;
+        r.seen = true;
+        i++;
+    }
+    std::vector<Region> list = Regions(game::Opt().netplay_sync);
+    list.insert(list.end(), g_auto.begin(), g_auto.end());
+    w.u8(0);
+    uint8_t n = 0;
+    for (const Region& r : list) {
+        if (w.b.size() + 9 + r.len > max) {
+            LOGR("netplay: sync region %06x+%u does not fit one packet, skipped", r.addr, r.len);
+            continue;
+        }
+        w.u32(r.addr);
+        w.u32(r.len);
+        w.u8(r.gen);
+        w.raw(kernel::HostPtr(r.addr), r.len);
+        n++;
+    }
+    w.b[0] = n;
+    return std::move(w.b);
+}
+
+// writes them into the guest's memory; how many words of it changed
+uint32_t ApplyBytes(const std::vector<uint8_t>& bytes) {
+    Reader r{bytes.data(), bytes.size()};
+    uint8_t n = r.u8();
+    uint32_t changed = 0;
+    for (uint8_t i = 0; r.ok && i < n; i++) {
+        uint32_t addr = r.u32(), len = r.u32();
+        uint8_t gen = r.u8();
+        if (!r.ok || len > r.n || addr < kGuestLo || uint64_t(addr) + len > kGuestEnd) break;
+        bool write = true;
+        if (gen != kNoGen && len == 4) {
+            uint32_t cur;
+            std::memcpy(&cur, kernel::HostPtr(addr), 4);
+            auto it = g_gw.find(addr);
+            if (it == g_gw.end()) {
+                it = g_gw.emplace(addr, GuestWord{cur, false}).first;
+                write = false;
+                LOGR("netplay: watching the word at %06x (%08x here) before copying the host's", addr, cur);
+            } else {
+                GuestWord& gw = it->second;
+                bool moved_like = cur != gw.last && Plausible(gen, gw.last, cur);
+                if (!gw.verified) {
+                    if (moved_like) {
+                        gw.verified = true;
+                        LOGR("netplay: the word at %06x moves like the generator here too, copying it", addr);
+                    } else {
+                        gw.last = cur;
+                        write = false;
+                        g_stat_unverified++;
+                    }
+                } else if (cur != gw.last && !moved_like) {
+                    gw.verified = false;
+                    gw.last = cur;
+                    write = false;
+                    LOGR("netplay: the word at %06x stopped moving like the generator, left alone", addr);
+                }
+            }
+            if (write) {
+                uint32_t host_value;
+                std::memcpy(&host_value, r.p, 4);
+                g_gw[addr].last = host_value;
+            }
+        }
+        if (write) {
+            if (std::memcmp(kernel::HostPtr(addr), r.p, len) != 0) changed++;
+            std::memcpy(kernel::HostPtr(addr), r.p, len);
+        }
+        r.p += len;
+        r.n -= len;
+    }
+    return changed;
+}
+
+void BuildPayload() { g_payload = MakePayload(kPayloadMax); }
+
+void ApplyPayload() { ApplyBytes(g_payload); }
 
 // under g_mtx: a new epoch: frame 0 on both sides after both have arrived. false when the session ended.
 bool Barrier(std::unique_lock<std::mutex>& lk) {
@@ -901,6 +1082,8 @@ bool Barrier(std::unique_lock<std::mutex>& lk) {
         g_send_hash_frame = UINT32_MAX;
         g_state_frame = g_state_rx_frame = g_peer_state_ack = UINT32_MAX;
         g_state_pay.clear();
+        g_scan_round = 0;  // each epoch (a level) looks again, unless a generator is known
+        g_snap_n = 0;
         std::fill(std::begin(g_lhash_frame), std::end(g_lhash_frame), UINT32_MAX);
         std::fill(std::begin(g_rhash_frame), std::end(g_rhash_frame), UINT32_MAX);
         if (g_host) BuildPayload();
@@ -934,6 +1117,10 @@ bool Start(bool host, const std::string& target) {
     Stop();
     std::lock_guard lock(g_mtx);
     g_gen++;
+    g_auto.clear();
+    g_gw.clear();
+    g_scan_round = 0;
+    g_snap_n = 0;
     g_error.clear();
     g_note.clear();
     g_quit = false;
@@ -1093,6 +1280,7 @@ void Rumble(int port, uint16_t& left, uint16_t& right) {
 }
 
 void Step() {
+    g_skip_now = -1;
     State st = g_state.load(std::memory_order_acquire);
     if ((st != State::Connected && st != State::Playing) || !g_save_ready.load()) return;
     input::Poll(0);  // the phone's own pad now, kept by Filter
@@ -1115,7 +1303,9 @@ void Step() {
         const uint32_t f = g_frame;
         {
             std::lock_guard latch(g_latch);
-            g_local[(f + g_delay) % kRing] = ToWire(g_raw);
+            WirePad mine = ToWire(g_raw);
+            mine.flags = g_skip_want.load() ? 1 : 0;
+            g_local[(f + g_delay) % kRing] = mine;
         }
         g_local_next = f + g_delay + 1;
         if (f % kHashEvery == 0 && HashOn()) {
@@ -1160,10 +1350,12 @@ void Step() {
             if (us > 4000) g_stat_late++;
             if (g_stat_frames >= 600) {
                 LOGR("netplay: 600 frames, waited %llu us each on average, %llu over 4 ms, longest %llu ms, ping %u ms, delay %u; "
-                     "state words: %llu copies had to change the guest's (of 10), %zu found by the scan",
+                     "state words: %llu copies had to change the guest's (of 10), %zu found by the scan, %llu not trusted yet",
                      static_cast<unsigned long long>(g_stat_wait_us / g_stat_frames), static_cast<unsigned long long>(g_stat_late),
                      static_cast<unsigned long long>(g_stat_max_us / 1000), unsigned(g_rtt.load()), g_delay,
-                     static_cast<unsigned long long>(g_stat_corr), g_auto.size());
+                     static_cast<unsigned long long>(g_stat_corr), g_auto.size(),
+                     static_cast<unsigned long long>(g_stat_unverified));
+                g_stat_unverified = 0;
                 g_stat_frames = g_stat_wait_us = g_stat_max_us = g_stat_late = 0;
                 g_stat_corr = g_stat_words = 0;
             }
@@ -1184,10 +1376,15 @@ void Step() {
             g_slot[0] = FromWire(g_host ? mine : theirs);
             g_slot[1] = FromWire(g_host ? theirs : mine);
         }
+        g_skip_now = ((mine.flags | theirs.flags) & 1) ? 1 : 0;
         g_frame = f + 1;
         g_last_step_ms = NowMs();
         return;
     }
 }
+
+void SetSkipWant(bool want) { g_skip_want = want; }
+
+int SkipThisFrame() { return g_skip_now.load(); }
 
 }  // namespace netplay

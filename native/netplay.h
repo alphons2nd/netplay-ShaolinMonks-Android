@@ -36,4 +36,9 @@ void Rumble(int port, uint16_t& left, uint16_t& right);
 // game thread, once per gameplay frame, before the game reads its pads: waits for the friend's input
 void Step();
 
+// frame skip is the same on both phones: SetSkipWant (game thread, before Step) says this phone is behind its clock,
+// and SkipThisFrame (after Step) is 1 when either phone is, 0 when neither, -1 when not in lockstep
+void SetSkipWant(bool want);
+int SkipThisFrame();
+
 }  // namespace netplay

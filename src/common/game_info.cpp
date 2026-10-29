@@ -44,6 +44,7 @@ void Load(const void* table) {
     o.netplay_delay = uint32_t(std::clamp<int64_t>(t["netplay_delay"].value_or<int64_t>(o.netplay_delay), 1, 12));
     o.netplay_copy_save = t["netplay_copy_save"].value_or(o.netplay_copy_save);
     o.netplay_auto_rng = t["netplay_auto_rng"].value_or(o.netplay_auto_rng);
+    o.netplay_diag = t["netplay_diag"].value_or(o.netplay_diag);
     for (auto [key, list] : {std::pair{"netplay_sync", &o.netplay_sync}, std::pair{"netplay_hash", &o.netplay_hash}})
         if (const toml::array* a = t[key].as_array()) {
             list->clear();
@@ -77,6 +78,7 @@ void Save(void* table) {
     t.insert("netplay_delay", int64_t(o.netplay_delay));
     t.insert("netplay_copy_save", o.netplay_copy_save);
     t.insert("netplay_auto_rng", o.netplay_auto_rng);
+    t.insert("netplay_diag", o.netplay_diag);
     toml::array sync, hash;
     for (const std::string& v : o.netplay_sync) sync.push_back(v);
     for (const std::string& v : o.netplay_hash) hash.push_back(v);

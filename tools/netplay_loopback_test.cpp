@@ -25,7 +25,7 @@ uint8_t* g_base = nullptr;
 }
 namespace mem {
 // the harness maps everything but 0x3000000 up, to see the scan skip unmapped pages
-bool IsCommitted(uint32_t va) { return va < 0x3000000 || va >= 0x3800000; }
+bool IsCommitted(uint32_t va) { return va < 0x4000000 && (va < 0x3000000 || va >= 0x3800000); }
 }
 namespace game {
 Options& Opt() {

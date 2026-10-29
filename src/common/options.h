@@ -68,6 +68,7 @@ struct Options {
     bool netplay_copy_save = true;  // the host's saves are copied over the guest's when it joins (its own are kept)
     // guest memory as "ADDRESS:LENGTH": the first list is copied from the host to the guest at each barrier (an RNG's
     // state), the second is what the state hash covers (none: the image's data and bss)
+    bool netplay_diag = true;  // both phones compare their memory at the start of a level and the guest logs what differs
     bool netplay_auto_rng = true;  // the host looks for the game's random number generator and copies it to the guest
     std::vector<std::string> netplay_sync;
     std::vector<std::string> netplay_hash;

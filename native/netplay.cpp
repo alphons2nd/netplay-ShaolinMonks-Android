@@ -32,6 +32,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <string>
@@ -578,6 +579,230 @@ void FetchSave(uint32_t gen, sockaddr_in host) {
     done("host saves copied; yours are in hdd.netplay-backup");
 }
 
+// ---- memory comparison, for finding why two games differ. At a few frames of each epoch both phones keep a copy of the
+// guest's memory (the committed pages that are not all zero), and the guest asks the host for the host's of the same
+// frame over TCP and logs which pages and words differ. Other threads of the game run meanwhile, so a word that
+// differs may also be one of theirs; the words that differ at every look are the ones to look at.
+constexpr uint32_t kDiagMagic = 0x47444B4D;  // "MKDG"
+constexpr uint32_t kDiagFrames[] = {2, 62, 302};
+constexpr uint32_t kDiagMaxPages = 1500;     // fetched with their words, at most
+constexpr uint32_t kDiagMaxBytes = 400u << 20;  // the host's copies held, at most
+struct DiagRange {
+    uint32_t lo, hi;
+};
+constexpr DiagRange kDiagRanges[] = {{0x10000, 0x20000000},
+                                     {mem::kContiguousBase, mem::kContiguousBase + mem::kPhysicalSize},
+                                     {mem::kSystemBase, mem::kSystemBase + mem::kSystemSize},
+                                     {mem::kStackBase, mem::kStackBase + mem::kStackSize}};
+
+struct Snap {
+    uint32_t epoch = 0, frame = 0;
+    std::vector<uint32_t> no;    // page numbers (address >> 12), ascending
+    std::vector<uint32_t> hash;
+    std::vector<uint8_t> data;   // 4 KB for each
+};
+std::mutex g_snaps_mtx;
+std::vector<std::shared_ptr<Snap>> g_snaps;  // the host's
+
+const uint8_t* ZeroPage() {
+    static const std::vector<uint8_t> z(mem::kPage, 0);
+    return z.data();
+}
+
+std::shared_ptr<Snap> TakeSnap(uint32_t epoch, uint32_t frame) {
+    auto s = std::make_shared<Snap>();
+    s->epoch = epoch;
+    s->frame = frame;
+    for (const DiagRange& r : kDiagRanges)
+        for (uint64_t a = r.lo; a < r.hi; a += mem::kPage) {
+            if (!mem::IsCommitted(uint32_t(a))) continue;
+            const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(uint32_t(a)));
+            if (std::memcmp(p, ZeroPage(), mem::kPage) == 0) continue;
+            s->no.push_back(uint32_t(a >> 12));
+            s->hash.push_back(HashBytes(p, mem::kPage));
+            s->data.insert(s->data.end(), p, p + mem::kPage);
+        }
+    return s;
+}
+
+// the host's side of a comparison: the table of pages, then the pages the guest wants
+void ServeDiag(int fd) {
+    SetTimeouts(fd, 15);
+    uint32_t req[2];
+    if (!RecvAll(fd, req, 8)) {
+        close(fd);
+        return;
+    }
+    std::shared_ptr<Snap> s;
+    {
+        std::lock_guard lock(g_snaps_mtx);
+        for (const auto& x : g_snaps)
+            if (x->epoch == req[0] && x->frame == req[1]) s = x;
+    }
+    uint32_t head[3] = {kDiagMagic, s ? 0u : 1u, s ? uint32_t(s->no.size()) : 0u};
+    bool ok = SendAll(fd, head, 12);
+    if (ok && s) {
+        std::vector<uint32_t> table;
+        table.reserve(s->no.size() * 2);
+        for (size_t i = 0; i < s->no.size(); i++) {
+            table.push_back(s->no[i]);
+            table.push_back(s->hash[i]);
+        }
+        uint32_t m = 0;
+        ok = SendAll(fd, table.data(), table.size() * 4) && RecvAll(fd, &m, 4) && m <= kDiagMaxPages;
+        std::vector<uint32_t> want(ok ? m : 0);
+        ok = ok && RecvAll(fd, want.data(), size_t(m) * 4);
+        for (uint32_t i = 0; ok && i < m; i++) {
+            auto it = std::lower_bound(s->no.begin(), s->no.end(), want[i]);
+            const uint8_t* p = it != s->no.end() && *it == want[i] ? &s->data[size_t(it - s->no.begin()) * mem::kPage] : ZeroPage();
+            ok = SendAll(fd, p, mem::kPage);
+        }
+    }
+    close(fd);
+}
+
+// the first bytes of a connection say what it wants: a comparison, else (nothing, the guest waits) the saves
+void ServeTcp(int fd, bool share_saves) {
+    pollfd pfd{fd, POLLIN, 0};
+    uint32_t magic = 0;
+    if (poll(&pfd, 1, 150) > 0 && recv(fd, &magic, 4, MSG_PEEK) == 4 && magic == kDiagMagic) {
+        recv(fd, &magic, 4, 0);
+        ServeDiag(fd);
+    } else {
+        ServeSave(fd, share_saves);
+    }
+}
+
+const char* DiagClass(uint32_t addr) {
+    if (addr >= mem::kStackBase) return "stacks";
+    if (addr >= mem::kSystemBase) return "system";
+    if (addr >= mem::kContiguousBase) return "contiguous";
+    if (addr >= kImageHi) return "heap";
+    if (addr >= kImageLo) return "data";
+    return "code";
+}
+
+// the guest's side, on its own thread
+void CompareThread(uint32_t gen, std::shared_ptr<Snap> mine, sockaddr_in host) {
+    static const uint32_t kZeroHash = HashBytes(ZeroPage(), mem::kPage);
+    int fd = -1;
+    std::vector<uint32_t> table;
+    uint32_t n = 0;
+    for (int attempt = 0; attempt < 10 && fd < 0; attempt++) {
+        if (g_gen.load() != gen) return;
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s < 0) return;
+        fcntl(s, F_SETFL, fcntl(s, F_GETFL) | O_NONBLOCK);
+        connect(s, reinterpret_cast<sockaddr*>(&host), sizeof host);
+        pollfd pfd{s, POLLOUT, 0};
+        int err = 0;
+        socklen_t el = sizeof err;
+        if (poll(&pfd, 1, 5000) <= 0 || getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &el) != 0 || err) {
+            close(s);
+            LOGR("netplay: diag epoch %u frame %u: the host did not answer", mine->epoch, mine->frame);
+            return;
+        }
+        fcntl(s, F_SETFL, fcntl(s, F_GETFL) & ~O_NONBLOCK);
+        SetTimeouts(s, 15);
+        uint32_t req[3] = {kDiagMagic, mine->epoch, mine->frame}, head[3] = {};
+        if (!SendAll(s, req, 12) || !RecvAll(s, head, 12) || head[0] != kDiagMagic) {
+            close(s);
+            return;
+        }
+        if (head[1] != 0 || head[2] > (1u << 20)) {  // the host is not at that frame yet
+            close(s);
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            continue;
+        }
+        n = head[2];
+        table.resize(size_t(n) * 2);
+        if (!RecvAll(s, table.data(), table.size() * 4)) {
+            close(s);
+            return;
+        }
+        fd = s;
+    }
+    if (fd < 0) return;
+    // the pages that differ: the host's table against this phone's, a page one of them lacks being all zero
+    std::vector<uint32_t> diff;
+    size_t i = 0, j = 0;
+    while (i < n || j < mine->no.size()) {
+        uint32_t hp = i < n ? table[i * 2] : UINT32_MAX, mp = j < mine->no.size() ? mine->no[j] : UINT32_MAX;
+        if (hp == mp) {
+            if (table[i * 2 + 1] != mine->hash[j]) diff.push_back(hp);
+            i++;
+            j++;
+        } else if (hp < mp) {
+            if (table[i * 2 + 1] != kZeroHash) diff.push_back(hp);
+            i++;
+        } else {
+            diff.push_back(mp);
+            j++;
+        }
+    }
+    std::map<std::string, uint32_t> classes;
+    std::vector<uint32_t> fetch;  // not the stacks: they differ at every look
+    for (uint32_t p : diff) {
+        classes[DiagClass(p << 12)]++;
+        if ((p << 12) < mem::kStackBase && fetch.size() < kDiagMaxPages) fetch.push_back(p);
+    }
+    char line[400];
+    int len = std::snprintf(line, sizeof line, "netplay: diag epoch %u frame %u: %zu pages here, %u at the host, %zu differ:",
+                            mine->epoch, mine->frame, mine->no.size(), n, diff.size());
+    for (const auto& [name, count] : classes) len += std::snprintf(line + len, sizeof line - size_t(len), " %s %u,", name.c_str(), count);
+    LOGR("%s", line);
+    uint32_t m = uint32_t(fetch.size());
+    std::vector<uint8_t> pages(size_t(m) * mem::kPage);
+    bool ok = SendAll(fd, &m, 4) && SendAll(fd, fetch.data(), size_t(m) * 4) && RecvAll(fd, pages.data(), pages.size());
+    close(fd);
+    if (!ok || g_gen.load() != gen) return;
+    uint64_t words = 0;
+    uint32_t logged = 0, shown_pages = 0;
+    for (uint32_t k = 0; k < m; k++) {
+        const uint32_t addr = fetch[k] << 12;
+        const uint8_t* theirs = &pages[size_t(k) * mem::kPage];
+        auto it = std::lower_bound(mine->no.begin(), mine->no.end(), fetch[k]);
+        const uint8_t* here = it != mine->no.end() && *it == fetch[k] ? &mine->data[size_t(it - mine->no.begin()) * mem::kPage] : ZeroPage();
+        uint32_t count = 0;
+        char text[500];
+        int n2 = 0;
+        for (uint32_t w = 0; w < mem::kPage; w += 4) {
+            uint32_t a, b;
+            std::memcpy(&a, theirs + w, 4);
+            std::memcpy(&b, here + w, 4);
+            if (a == b) continue;
+            count++;
+            if (count <= 6) n2 += std::snprintf(text + n2, sizeof text - size_t(n2), " +%03x %08x/%08x", w, a, b);
+        }
+        words += count;
+        if (count && shown_pages < 90) {
+            shown_pages++;
+            LOGR("netplay: diag %08x (%s): %u words differ (host/here):%s", addr, DiagClass(addr), count, text);
+        }
+        logged += count ? 1 : 0;
+    }
+    LOGR("netplay: diag epoch %u frame %u: %llu words differ in %u of the %u pages fetched", mine->epoch, mine->frame,
+         static_cast<unsigned long long>(words), logged, m);
+}
+
+// under g_mtx, game thread, at the start of gameplay frame f
+void MaybeDiag(uint32_t f) {
+    if (!game::Opt().netplay_diag || std::find(std::begin(kDiagFrames), std::end(kDiagFrames), f) == std::end(kDiagFrames)) return;
+    std::shared_ptr<Snap> s = TakeSnap(g_epoch, f);
+    if (g_host) {
+        std::lock_guard lock(g_snaps_mtx);
+        g_snaps.push_back(s);
+        size_t bytes = 0;
+        for (const auto& x : g_snaps) bytes += x->data.size();
+        while (g_snaps.size() > 1 && (g_snaps.size() > 4 || bytes > kDiagMaxBytes)) {
+            bytes -= g_snaps.front()->data.size();
+            g_snaps.erase(g_snaps.begin());
+        }
+    } else {
+        std::thread(CompareThread, g_gen.load(), s, g_peer).detach();
+    }
+}
+
 // ---- packets, g_mtx held
 void OnInput(Reader& r, const Header& h) {
     if (h.epoch > g_peer_epoch) g_peer_epoch = h.epoch;
@@ -734,7 +959,7 @@ void NetLoop() {
                     std::lock_guard lock(g_mtx);
                     mine = g_state.load() != State::Hosting && from.sin_addr.s_addr == g_peer.sin_addr.s_addr;
                 }
-                if (mine) std::thread(ServeSave, fd, game::Opt().netplay_copy_save).detach();
+                if (mine) std::thread(ServeTcp, fd, game::Opt().netplay_copy_save).detach();
                 else close(fd);
             }
         }
@@ -1345,6 +1570,7 @@ void Step() {
             g_state_frame = f;
         }
         if (g_host) MaybeScan(f);
+        MaybeDiag(f);
         const bool needs_state = !g_host && f > 0 && f % kStateEvery == 0;
         SendInput();
         auto wait_start = Clock::now();

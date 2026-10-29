@@ -43,6 +43,7 @@
 #include "core/input.h"
 #include "core/log.h"
 #include "kernel/kernel.h"
+#include "kernel/memory.h"
 
 namespace netplay {
 
@@ -263,6 +264,15 @@ std::vector<Region> Regions(const std::vector<std::string>& list) {
     return out;
 }
 
+// the guest's memory is only mapped where the game committed it: anything else faults. Every read or write of an
+// address that did not come from this phone's own checks goes through this
+bool Mapped(uint32_t addr, uint32_t len) {
+    if (len == 0 || addr < kGuestLo || uint64_t(addr) + len > kGuestEnd) return false;
+    for (uint32_t p = addr & ~(mem::kPage - 1); p < addr + len; p += mem::kPage)
+        if (!mem::IsCommitted(p)) return false;
+    return true;
+}
+
 // ---- state hash
 uint32_t HashBytes(const uint8_t* p, size_t n) {
     uint64_t h = 0xcbf29ce484222325ull;
@@ -291,13 +301,14 @@ uint32_t HashGuest() {
     std::vector<Region> list = HashAuto() ? std::vector<Region>{} : Regions(game::Opt().netplay_hash);
     uint32_t h = 0x811C9DC5;
     if (!list.empty()) {
-        for (const Region& r : list) h = (h ^ HashBytes(static_cast<const uint8_t*>(kernel::HostPtr(r.addr)), r.len)) * 16777619u;
+        for (const Region& r : list)
+            if (Mapped(r.addr, r.len)) h = (h ^ HashBytes(static_cast<const uint8_t*>(kernel::HostPtr(r.addr)), r.len)) * 16777619u;
         g_pages.clear();
         return h;
     }
     g_pages.clear();
     for (uint32_t a = kHashLo; a < kHashHi; a += 0x1000) {
-        uint32_t p = HashBytes(static_cast<const uint8_t*>(kernel::HostPtr(a)), 0x1000);
+        uint32_t p = !Mapped(a, 0x1000) ? 0 : HashBytes(static_cast<const uint8_t*>(kernel::HostPtr(a)), 0x1000);
         g_pages.push_back(p);
         h = (h ^ p) * 16777619u;
     }
@@ -967,8 +978,10 @@ void MaybeScan(uint32_t f) {
     uint32_t base = kScanFirst + g_scan_round * kScanRepeat;
     int which = f == base ? 0 : f == base + kScanGap ? 1 : f == base + 2 * kScanGap ? 2 : -1;
     if (which < 0 || which != g_snap_n) return;
-    const uint8_t* mem = static_cast<const uint8_t*>(kernel::HostPtr(kGuestLo));
-    g_snap[which].assign(mem, mem + (kGuestEnd - kGuestLo));
+    // the committed pages only, the others stay zero in every look
+    g_snap[which].assign(kGuestEnd - kGuestLo, 0);
+    for (uint32_t a = kGuestLo; a < kGuestEnd; a += mem::kPage)
+        if (mem::IsCommitted(a)) std::memcpy(&g_snap[which][a - kGuestLo], kernel::HostPtr(a), mem::kPage);
     g_snap_n = which + 1;
     if (which < 2) return;
     g_snap_n = 0;
@@ -984,9 +997,10 @@ std::vector<uint8_t> MakePayload(size_t max) {
     // a found word that no longer moves along its generator is not one any more (a level was unloaded): dropped
     for (size_t i = 0; i < g_auto.size();) {
         Region& r = g_auto[i];
-        uint32_t v;
-        std::memcpy(&v, kernel::HostPtr(r.addr), 4);
-        if (r.seen && !Plausible(r.gen, r.last, v)) {
+        uint32_t v = 0;
+        const bool mapped = Mapped(r.addr, 4);
+        if (mapped) std::memcpy(&v, kernel::HostPtr(r.addr), 4);
+        if (!mapped || (r.seen && !Plausible(r.gen, r.last, v))) {
             LOGR("netplay: the word at %06x no longer moves like a generator, dropped", r.addr);
             g_auto.erase(g_auto.begin() + long(i));
             continue;
@@ -1000,6 +1014,7 @@ std::vector<uint8_t> MakePayload(size_t max) {
     w.u8(0);
     uint8_t n = 0;
     for (const Region& r : list) {
+        if (!Mapped(r.addr, r.len)) continue;
         if (w.b.size() + 9 + r.len > max) {
             LOGR("netplay: sync region %06x+%u does not fit one packet, skipped", r.addr, r.len);
             continue;
@@ -1023,6 +1038,11 @@ uint32_t ApplyBytes(const std::vector<uint8_t>& bytes) {
         uint32_t addr = r.u32(), len = r.u32();
         uint8_t gen = r.u8();
         if (!r.ok || len > r.n || addr < kGuestLo || uint64_t(addr) + len > kGuestEnd) break;
+        if (!Mapped(addr, len)) {  // not committed on this phone (the heaps differ): not ours to write
+            r.p += len;
+            r.n -= len;
+            continue;
+        }
         bool write = true;
         if (gen != kNoGen && len == 4) {
             uint32_t cur;

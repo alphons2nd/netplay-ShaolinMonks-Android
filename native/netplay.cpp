@@ -52,7 +52,7 @@ namespace fs = std::filesystem;
 
 constexpr uint32_t kMagic = 0x504E4D53;      // "SMNP"
 constexpr uint32_t kSaveMagic = 0x56534D53;  // "SMSV"
-constexpr uint8_t kVersion = 1;
+constexpr uint8_t kVersion = 2;
 enum Type : uint8_t { kHello = 1, kWelcome, kInput, kSync, kPing, kPong, kBye, kPad };
 
 constexpr uint32_t kRing = 1024;      // frames kept, far more than the delay and the retransmit window
@@ -62,6 +62,12 @@ constexpr uint32_t kHashSlots = 64;
 constexpr int kGapMs = 1000;          // no gameplay frame for this long: back to the phone's own pad
 constexpr int kDeadMs = 6000;         // no packet for this long: the link is gone
 constexpr size_t kPayloadMax = 1100;  // the barrier's guest memory, in one packet
+constexpr size_t kStateMax = 600;     // the same riding on an input packet
+constexpr uint32_t kStateEvery = 60;  // frames between two copies of the host's state words to the guest
+// the host looks for the game's random number generator in the image's data: three snapshots kScanGap frames apart,
+// from frame kScanFirst, again kScanRepeat frames on while none was found
+constexpr uint32_t kScanLo = 0x3F0000, kScanHi = 0x5CB000, kScanGap = 20, kScanFirst = 240, kScanRepeat = 600;
+constexpr uint32_t kScanSteps = 20000, kScanRounds = 6;
 // guest memory the hash covers without any setting: the image's data and bss, up to the page of 0x5CAB98
 constexpr uint32_t kHashLo = 0x4A0000, kHashHi = 0x5CB000;
 constexpr uint32_t kGuestLo = 0x10000, kGuestEnd = 0x04000000;  // what a setting may name: the console's 64 MB
@@ -157,6 +163,12 @@ uint32_t g_epoch = 0, g_peer_epoch = 0, g_frame = 0;
 bool g_peer_here = false;   // the friend's packet of this epoch was seen
 bool g_sync_got = false;    // and, on the guest, the host's payload
 std::vector<uint8_t> g_payload;
+// state words the host copies to the guest every kStateEvery frames: Options::netplay_sync and what the scan found
+uint32_t g_state_frame = UINT32_MAX;     // host: the frame the held copy is of
+uint32_t g_state_rx_frame = UINT32_MAX;  // guest: the frame of the copy it has; the host's ack of it
+uint32_t g_peer_state_ack = UINT32_MAX;  // host: the newest copy the guest has
+std::vector<uint8_t> g_state_pay;        // host: the copy to send; guest: the copy received
+uint64_t g_stat_corr = 0, g_stat_words = 0;  // guest: copies that changed something, state words in them
 WirePad g_local[kRing], g_remote[kRing];
 uint32_t g_local_next = 0;   // my frames [0, g_local_next) are filed
 uint32_t g_remote_next = 0;  // the friend's frames [0, g_remote_next) are here
@@ -165,6 +177,12 @@ uint32_t g_lhash_frame[kHashSlots], g_lhash[kHashSlots], g_rhash_frame[kHashSlot
 uint32_t g_send_hash_frame = UINT32_MAX, g_send_hash = 0;
 std::vector<uint32_t> g_pages;  // page hashes of the latest hashed frame
 uint32_t g_pages_frame = 0;
+
+std::vector<Region> g_auto;  // the host's: state words the scan found
+std::vector<uint8_t> g_snap[3];
+int g_snap_n = 0;
+uint32_t g_scan_round = 0;
+bool g_scan_busy = false;
 
 std::mutex g_latch;
 input::Pad g_raw;               // the phone's own port 0, as Filter last saw it
@@ -343,6 +361,13 @@ void SendInput() {
     for (uint32_t i = 0; i < count; i++) w.raw(&g_local[(first + i) % kRing], sizeof(WirePad));
     w.u32(g_send_hash_frame);
     w.u32(g_send_hash);
+    w.u32(g_state_rx_frame);  // the guest's ack of the host's state words
+    bool attach = g_host && g_state_frame != UINT32_MAX && (g_peer_state_ack == UINT32_MAX || g_peer_state_ack < g_state_frame);
+    w.u32(attach ? g_state_frame : UINT32_MAX);
+    if (attach) {
+        w.u16(uint16_t(g_state_pay.size()));
+        w.raw(g_state_pay.data(), g_state_pay.size());
+    }
     Send(w);
 }
 
@@ -547,6 +572,18 @@ void OnInput(Reader& r, const Header& h) {
         g_rhash[s] = hv;
         CheckHash(hf);
     }
+    uint32_t sack = r.u32(), sf = r.u32();
+    if (r.ok) {
+        if (g_host) {
+            if (sack != UINT32_MAX && (g_peer_state_ack == UINT32_MAX || sack > g_peer_state_ack)) g_peer_state_ack = sack;
+        } else if (sf != UINT32_MAX && (g_state_rx_frame == UINT32_MAX || sf > g_state_rx_frame)) {
+            uint16_t len = r.u16();
+            if (r.ok && len <= kStateMax && r.n >= len) {
+                g_state_pay.assign(r.p, r.p + len);
+                g_state_rx_frame = sf;
+            }
+        }
+    }
     g_cv.notify_all();
 }
 
@@ -728,14 +765,15 @@ std::string LocalAddresses() {
 }
 
 // under g_mtx, game thread: the guest memory the host chose, in the payload
-void BuildPayload() {
-    g_payload.clear();
+// the host's state words as bytes: a count, then address, length and contents of each region
+std::vector<uint8_t> MakePayload(size_t max) {
     Writer w;
     std::vector<Region> list = Regions(game::Opt().netplay_sync);
+    list.insert(list.end(), g_auto.begin(), g_auto.end());
     w.u8(0);
     uint8_t n = 0;
     for (const Region& r : list) {
-        if (w.b.size() + 8 + r.len > kPayloadMax) {
+        if (w.b.size() + 8 + r.len > max) {
             LOGR("netplay: sync region %06x+%u does not fit one packet, skipped", r.addr, r.len);
             continue;
         }
@@ -745,19 +783,111 @@ void BuildPayload() {
         n++;
     }
     w.b[0] = n;
-    g_payload = std::move(w.b);
+    return std::move(w.b);
 }
 
-void ApplyPayload() {
-    Reader r{g_payload.data(), g_payload.size()};
+// writes them into the guest's memory; how many words of it changed
+uint32_t ApplyBytes(const std::vector<uint8_t>& bytes) {
+    Reader r{bytes.data(), bytes.size()};
     uint8_t n = r.u8();
+    uint32_t changed = 0;
     for (uint8_t i = 0; r.ok && i < n; i++) {
         uint32_t addr = r.u32(), len = r.u32();
         if (!r.ok || len > r.n || addr < kGuestLo || uint64_t(addr) + len > kGuestEnd) break;
+        if (std::memcmp(kernel::HostPtr(addr), r.p, len) != 0) changed++;
         std::memcpy(kernel::HostPtr(addr), r.p, len);
         r.p += len;
         r.n -= len;
     }
+    return changed;
+}
+
+void BuildPayload() { g_payload = MakePayload(kPayloadMax); }
+
+void ApplyPayload() { ApplyBytes(g_payload); }
+
+// ---- the random number generator scan (host). A generator's state is a word that, between two looks, has moved
+// some steps along a fixed recurrence. Three looks that fit one recurrence leave no doubt, so the scan is not a guess
+// at what the game does with the word, only at which words are the generator's.
+template <uint32_t A, uint32_t C>
+uint32_t Lcg(uint32_t x) {
+    return x * A + C;
+}
+uint32_t XorShift32(uint32_t x) {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return x;
+}
+template <uint32_t M>
+uint32_t ParkMiller(uint32_t x) {
+    return uint32_t(uint64_t(x) * M % 2147483647u);
+}
+struct Gen {
+    const char* name;
+    uint32_t (*step)(uint32_t);
+};
+constexpr Gen kGens[] = {{"lcg 214013 2531011 (the C runtime's rand)", Lcg<214013, 2531011>},
+                         {"lcg 1664525 1013904223", Lcg<1664525, 1013904223>},
+                         {"lcg 69069 1", Lcg<69069, 1>},
+                         {"lcg 1103515245 12345", Lcg<1103515245, 12345>},
+                         {"lcg 134775813 1", Lcg<134775813, 1>},
+                         {"lcg 22695477 1", Lcg<22695477, 1>},
+                         {"xorshift32", XorShift32},
+                         {"park-miller 16807", ParkMiller<16807>},
+                         {"park-miller 48271", ParkMiller<48271>}};
+
+bool Reaches(uint32_t (*step)(uint32_t), uint32_t from, uint32_t to) {
+    for (uint32_t k = 0; k < kScanSteps; k++) {
+        from = step(from);
+        if (from == to) return true;
+    }
+    return false;
+}
+
+void ScanThread(uint32_t gen, std::vector<uint8_t> a, std::vector<uint8_t> b, std::vector<uint8_t> c) {
+    std::vector<Region> found;
+    uint32_t changed = 0;
+    for (size_t i = 0; i + 4 <= a.size() && found.size() < 8; i += 4) {
+        uint32_t x, y, z;
+        std::memcpy(&x, &a[i], 4);
+        std::memcpy(&y, &b[i], 4);
+        std::memcpy(&z, &c[i], 4);
+        if (x == y || y == z) continue;
+        changed++;
+        for (const Gen& g : kGens) {
+            if (!Reaches(g.step, x, y) || !Reaches(g.step, y, z)) continue;
+            uint32_t addr = kScanLo + uint32_t(i);
+            LOGR("netplay: random number generator found at %06x (%s): %08x, %08x, %08x", addr, g.name, x, y, z);
+            found.push_back({addr, 4});
+            break;
+        }
+    }
+    LOGR("netplay: scan of the image's data: %u words moved in both intervals, %u generator(s) found", changed,
+         unsigned(found.size()));
+    std::lock_guard lock(g_mtx);
+    g_scan_busy = false;
+    if (g_gen.load() != gen || g_state.load() == State::Off) return;
+    for (const Region& r : found) g_auto.push_back(r);
+    if (!found.empty()) g_scan_round = kScanRounds;  // done
+}
+
+// under g_mtx, host, at the start of gameplay frame f
+void MaybeScan(uint32_t f) {
+    if (!game::Opt().netplay_auto_rng || g_scan_busy || g_scan_round >= kScanRounds) return;
+    uint32_t base = kScanFirst + g_scan_round * kScanRepeat;
+    int which = f == base ? 0 : f == base + kScanGap ? 1 : f == base + 2 * kScanGap ? 2 : -1;
+    if (which < 0 || which != g_snap_n) {
+        if (which != 0) return;
+    }
+    const uint8_t* mem = static_cast<const uint8_t*>(kernel::HostPtr(kScanLo));
+    g_snap[which].assign(mem, mem + (kScanHi - kScanLo));
+    g_snap_n = which + 1;
+    if (which < 2) return;
+    g_snap_n = 0;
+    g_scan_busy = true;
+    g_scan_round++;
+    std::thread(ScanThread, g_gen.load(), std::move(g_snap[0]), std::move(g_snap[1]), std::move(g_snap[2])).detach();
 }
 
 // under g_mtx: a new epoch: frame 0 on both sides after both have arrived. false when the session ended.
@@ -769,6 +899,8 @@ bool Barrier(std::unique_lock<std::mutex>& lk) {
         g_local_next = g_remote_next = g_remote_ack = g_delay;
         for (uint32_t i = 0; i < g_delay; i++) g_local[i] = g_remote[i] = WirePad{};
         g_send_hash_frame = UINT32_MAX;
+        g_state_frame = g_state_rx_frame = g_peer_state_ack = UINT32_MAX;
+        g_state_pay.clear();
         std::fill(std::begin(g_lhash_frame), std::end(g_lhash_frame), UINT32_MAX);
         std::fill(std::begin(g_rhash_frame), std::end(g_rhash_frame), UINT32_MAX);
         if (g_host) BuildPayload();
@@ -996,13 +1128,21 @@ void Step() {
             g_send_hash = h;
             CheckHash(f);
         }
+        // the host's state words (the game's random numbers) are copied to the guest at the start of every kStateEvery-th
+        // frame, so the two games' generators stay one however many times either was drawn from in between
+        if (g_host && f > 0 && f % kStateEvery == 0) {
+            g_state_pay = MakePayload(kStateMax);
+            g_state_frame = f;
+        }
+        if (g_host) MaybeScan(f);
+        const bool needs_state = !g_host && f > 0 && f % kStateEvery == 0;
         SendInput();
         auto wait_start = Clock::now();
         // A frame that is slow to come is waited for, however long the link lives (a phone in the background, a bad
         // patch of Wi-Fi): leaving the epoch here would leave one phone up to the delay's frames ahead of the other,
         // and the games would differ for good. Only a friend who began a new epoch (it left gameplay) ends the wait.
         bool resync = false;
-        while (g_remote_next <= f) {
+        while (g_remote_next <= f || (needs_state && (g_state_rx_frame == UINT32_MAX || g_state_rx_frame < f))) {
             if (g_state.load() == State::Off) return;
             if (g_peer_epoch > g_epoch) {
                 resync = true;
@@ -1019,16 +1159,24 @@ void Step() {
             g_stat_max_us = std::max(g_stat_max_us, us);
             if (us > 4000) g_stat_late++;
             if (g_stat_frames >= 600) {
-                LOGR("netplay: 600 frames, waited %llu us each on average, %llu over 4 ms, longest %llu ms, ping %u ms, delay %u",
+                LOGR("netplay: 600 frames, waited %llu us each on average, %llu over 4 ms, longest %llu ms, ping %u ms, delay %u; "
+                     "state words: %llu copies had to change the guest's (of 10), %zu found by the scan",
                      static_cast<unsigned long long>(g_stat_wait_us / g_stat_frames), static_cast<unsigned long long>(g_stat_late),
-                     static_cast<unsigned long long>(g_stat_max_us / 1000), unsigned(g_rtt.load()), g_delay);
+                     static_cast<unsigned long long>(g_stat_max_us / 1000), unsigned(g_rtt.load()), g_delay,
+                     static_cast<unsigned long long>(g_stat_corr), g_auto.size());
                 g_stat_frames = g_stat_wait_us = g_stat_max_us = g_stat_late = 0;
+                g_stat_corr = g_stat_words = 0;
             }
         }
         if (resync) {
             LOGR("netplay: the friend left gameplay at frame %u, leaving epoch %u", f, g_epoch);
             g_lock_on = false;
             continue;
+        }
+        if (needs_state) {
+            uint32_t changed = ApplyBytes(g_state_pay);
+            g_stat_words += g_state_pay.size() > 1 ? 1 : 0;
+            if (changed) g_stat_corr++;
         }
         WirePad mine = g_local[f % kRing], theirs = g_remote[f % kRing];
         {

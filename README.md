@@ -54,7 +54,7 @@ Co-op over a direct network link, from the **NETPLAY** tab of the settings panel
 1. Both install the same build and have the same game files.
 2. The host opens the panel, **NETPLAY**, taps **HOST A GAME** and tells the friend the address shown there.
 3. The friend types it in **HOST ADDRESS** and taps **JOIN A GAME**. With **COPY HOST SAVES ON JOIN** on, the host's saves replace the friend's `hdd` folder; the friend's own are kept in `hdd.netplay-backup`. Join before loading a game, so the game reads the copied saves.
-4. Both start the same co-op game (same save, same character) and play. The first gameplay frame waits for the other phone, then both run together. The line at the top of the screen shows the state and the ping.
+4. Before gameplay both phones read the same two pads: the host's is player 1 and the friend's player 2, so the host drives the menus on both and the friend presses Start to join as player 2. Start the same co-op game (same save) and play. The first gameplay frame waits for the other phone, then both run together. The line at the top of the screen shows the state and the ping.
 
 This only works while the two games stay identical, which needs the game's random numbers and clocks to match. A hash of the game's memory is traded every second and **OUT OF SYNC** shows (and `DESYNC` goes to the log) at the first difference. Settings in `shaolinmonks.toml` for that:
 - `netplay_sync = ["0x5C0000:16"]`: guest memory (`ADDRESS:LENGTH`, one packet's worth in all) copied from the host to the friend at each start of gameplay, for example the random number generator's state.

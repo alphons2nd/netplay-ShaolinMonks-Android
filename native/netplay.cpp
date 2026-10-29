@@ -53,7 +53,7 @@ namespace fs = std::filesystem;
 constexpr uint32_t kMagic = 0x504E4D53;      // "SMNP"
 constexpr uint32_t kSaveMagic = 0x56534D53;  // "SMSV"
 constexpr uint8_t kVersion = 1;
-enum Type : uint8_t { kHello = 1, kWelcome, kInput, kSync, kPing, kPong, kBye };
+enum Type : uint8_t { kHello = 1, kWelcome, kInput, kSync, kPing, kPong, kBye, kPad };
 
 constexpr uint32_t kRing = 1024;      // frames kept, far more than the delay and the retransmit window
 constexpr uint32_t kMaxSend = 32;     // frames in a packet
@@ -168,6 +168,8 @@ uint32_t g_pages_frame = 0;
 std::mutex g_latch;
 input::Pad g_raw;               // the phone's own port 0, as Filter last saw it
 input::Pad g_slot[2];           // what the two ports read while playing
+WirePad g_live;                 // the friend's pad as it is now, outside lockstep (menus, loads)
+int64_t g_live_ms = 0;
 
 int64_t NowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
@@ -614,13 +616,22 @@ void OnPacket(const uint8_t* data, size_t len, const sockaddr_in& from) {
             break;
         }
         case kBye: Fail("your friend left"); break;
+        case kPad: {
+            WirePad w;
+            if (r.take(&w, sizeof w)) {
+                std::lock_guard latch(g_latch);
+                g_live = w;
+                g_live_ms = NowMs();
+            }
+            break;
+        }
         default: break;
     }
 }
 
 void NetLoop() {
     auto last_hello = Clock::now() - std::chrono::seconds(1), last_ping = last_hello, last_sync = last_hello,
-         last_input = last_hello;
+         last_input = last_hello, last_pad = last_hello;
     uint8_t buf[2048];
     while (!g_quit) {
         pollfd fds[2] = {{g_udp, POLLIN, 0}, {g_tcp, POLLIN, 0}};
@@ -657,6 +668,19 @@ void NetLoop() {
             if (since(g_last_rx) > kDeadMs) {
                 Fail("the connection to your friend was lost");
                 break;
+            }
+            // outside lockstep both games read the same two pads, the host's as player 1 and the guest's as player 2, as
+            // each phone's own pad now reaches the other: menus follow whoever presses, and the guest can join with Start
+            if (since(last_pad) >= 8) {
+                last_pad = now;
+                WirePad mine;
+                {
+                    std::lock_guard latch(g_latch);
+                    mine = ToWire(g_raw);
+                }
+                Writer w = Begin(kPad, g_epoch);
+                w.raw(&mine, sizeof mine);
+                Send(w);
             }
             if (since(last_ping) >= 500) {
                 last_ping = now;
@@ -900,11 +924,20 @@ void Filter(int port, input::Pad& pad) {
     if (st != State::Connected && st != State::Playing) return;
     if (port != 0 && port != 1) return;
     bool playing = st == State::Playing && NowMs() - g_last_step_ms.load(std::memory_order_relaxed) < kGapMs;
+    std::lock_guard lock(g_latch);
     if (playing) {
-        std::lock_guard lock(g_latch);
         pad = g_slot[port];
-    } else if (port == 1) {
-        pad = input::Pad{};  // the friend's pad is there, held by nobody, until gameplay
+        return;
+    }
+    // not in lockstep: the host's live pad is player 1 and the guest's live pad player 2, on both phones
+    bool host = g_host.load();
+    input::Pad remote;
+    remote.connected = true;
+    if (NowMs() - g_live_ms < 300) remote = FromWire(g_live);
+    if (host) {
+        if (port == 1) pad = remote;
+    } else {
+        pad = port == 0 ? remote : g_raw;
         pad.connected = true;
     }
 }

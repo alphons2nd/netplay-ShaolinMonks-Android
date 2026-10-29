@@ -40,7 +40,8 @@ uint32_t ConsoleLanguage() {
 // same way, so the world keeps its speed and the frame rate drops instead. With FRAME SKIP off the game's own
 // choice stands: slow motion under 60, as the console had it.
 void FrameSkip(X86Context&, uint8_t*) {
-    // netplay first: it may wait for the friend's pad, and the clock below should not count that wait as lag
+    // netplay first: it may wait for the friend's pad. The skip below still follows this phone's clock, so a phone that
+    // cannot hold 60 draws fewer frames instead of slowing the pair down; it only skips drawing, the game steps the same.
     netplay::Step();
     using clock = std::chrono::steady_clock;
     constexpr uint32_t kSkipDraw = 0x5CAB98;
@@ -51,9 +52,7 @@ void FrameSkip(X86Context&, uint8_t*) {
     static clock::time_point due;
     static int skips = 0;
     auto now = clock::now();
-    // in a netplay session the game's own skips only: a skip decided by this phone's clock is not one the friend's
-    // game takes, and a slow phone slows the pair down instead
-    if (!game::Opt().frame_skip || netplay::GetState() == netplay::State::Playing) {
+    if (!game::Opt().frame_skip) {
         due = now;  // turned on again, it starts from here
         skips = 0;
         return;

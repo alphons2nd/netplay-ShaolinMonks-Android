@@ -147,7 +147,8 @@ std::atomic<uint32_t> g_rtt{0};
 std::atomic<bool> g_desync{false};
 std::atomic<int64_t> g_last_step_ms{0};
 std::atomic<bool> g_barrier_flag{false};
-std::atomic<int64_t> g_wait_since{0};  // ms, the friend's frame has not come since
+std::atomic<int64_t> g_wait_since{0};
+uint64_t g_stat_frames = 0, g_stat_wait_us = 0, g_stat_max_us = 0, g_stat_late = 0;  // under g_mtx  // ms, the friend's frame has not come since
 
 // lockstep
 bool g_lock_on = false;
@@ -236,8 +237,17 @@ uint32_t HashBytes(const uint8_t* p, size_t n) {
 }
 
 // the state hash of this frame: the named regions, else every page of the default range (kept for the diagnosis)
+// netplay_hash names the regions; "auto" is the image's data and bss, which holds clocks and buffers that differ between
+// two phones whatever the game does, so it is for finding the page where the games part, not for a normal session
+bool HashAuto() {
+    const auto& l = game::Opt().netplay_hash;
+    return std::find(l.begin(), l.end(), "auto") != l.end();
+}
+
+bool HashOn() { return !game::Opt().netplay_hash.empty(); }
+
 uint32_t HashGuest() {
-    std::vector<Region> list = Regions(game::Opt().netplay_hash);
+    std::vector<Region> list = HashAuto() ? std::vector<Region>{} : Regions(game::Opt().netplay_hash);
     uint32_t h = 0x811C9DC5;
     if (!list.empty()) {
         for (const Region& r : list) h = (h ^ HashBytes(static_cast<const uint8_t*>(kernel::HostPtr(r.addr)), r.len)) * 16777619u;
@@ -976,7 +986,7 @@ void Step() {
             g_local[(f + g_delay) % kRing] = ToWire(g_raw);
         }
         g_local_next = f + g_delay + 1;
-        if (f % kHashEvery == 0) {
+        if (f % kHashEvery == 0 && HashOn()) {
             uint32_t h = HashGuest();
             uint32_t s = (f / kHashEvery) % kHashSlots;
             g_lhash_frame[s] = f;
@@ -987,6 +997,7 @@ void Step() {
             CheckHash(f);
         }
         SendInput();
+        auto wait_start = Clock::now();
         // A frame that is slow to come is waited for, however long the link lives (a phone in the background, a bad
         // patch of Wi-Fi): leaving the epoch here would leave one phone up to the delay's frames ahead of the other,
         // and the games would differ for good. Only a friend who began a new epoch (it left gameplay) ends the wait.
@@ -1001,6 +1012,19 @@ void Step() {
             g_cv.wait_for(lock, std::chrono::milliseconds(4));
         }
         g_wait_since = 0;
+        {
+            uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - wait_start).count());
+            g_stat_frames++;
+            g_stat_wait_us += us;
+            g_stat_max_us = std::max(g_stat_max_us, us);
+            if (us > 4000) g_stat_late++;
+            if (g_stat_frames >= 600) {
+                LOGR("netplay: 600 frames, waited %llu us each on average, %llu over 4 ms, longest %llu ms, ping %u ms, delay %u",
+                     static_cast<unsigned long long>(g_stat_wait_us / g_stat_frames), static_cast<unsigned long long>(g_stat_late),
+                     static_cast<unsigned long long>(g_stat_max_us / 1000), unsigned(g_rtt.load()), g_delay);
+                g_stat_frames = g_stat_wait_us = g_stat_max_us = g_stat_late = 0;
+            }
+        }
         if (resync) {
             LOGR("netplay: the friend left gameplay at frame %u, leaving epoch %u", f, g_epoch);
             g_lock_on = false;

@@ -59,13 +59,10 @@ void FrameSkip(X86Context&, uint8_t*) {
         due = now;  // turned on again, it starts from here
         skips = 0;
     }
-    // netplay first: it may wait for the friend's pad. A phone that is behind says so in its pad and both skip the same
-    // frames, because drawing may draw from the game's random numbers and the two games must make the same draws
-    netplay::SetSkipWant(late);
+    // netplay first: it may wait for the friend's pad. This phone's own clock decides the skip: sharing it made the
+    // faster phone skip as often as the slower one, and the game's own PAL skip leaves the world's steps as they are
     netplay::Step();
-    const int shared = netplay::SkipThisFrame();
-    if (shared >= 0) late = shared != 0;
-    else if (!on) return;
+    if (!on) return;
     if (late) kernel::W32(kSkipDraw, 1);
     skips = kernel::R32(kSkipDraw) ? skips + 1 : 0;
     due += kStep;

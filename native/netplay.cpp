@@ -55,7 +55,7 @@ namespace fs = std::filesystem;
 
 constexpr uint32_t kMagic = 0x504E4D53;      // "SMNP"
 constexpr uint32_t kSaveMagic = 0x56534D53;  // "SMSV"
-constexpr uint8_t kVersion = 3;
+constexpr uint8_t kVersion = 4;
 enum Type : uint8_t { kHello = 1, kWelcome, kInput, kSync, kPing, kPong, kBye, kPad };
 
 constexpr uint32_t kRing = 1024;      // frames kept, far more than the delay and the retransmit window
@@ -203,6 +203,10 @@ struct GuestWord {
     bool verified = false;
 };
 std::map<uint32_t, GuestWord> g_gw;
+// state copy: the host leaves its barrier only after the guest has taken its pages
+uint32_t g_state_copied_epoch = UINT32_MAX;  // host: the epoch whose copy was served
+bool g_peer_copy = false;                    // host: the guest says a copy is on its way
+uint8_t g_copy_flag = 0;                     // guest, in its SYNC: 1 a copy is pending, 2 done or given up, 0 none asked
 uint64_t g_stat_unverified = 0;
 
 // frame skip, the same on both phones: each says in its pad whether it is late, the frame is skipped if either is
@@ -382,6 +386,7 @@ void SendSync() {
     uint16_t len = g_host ? uint16_t(g_payload.size()) : 0;
     w.u16(len);
     if (len) w.raw(g_payload.data(), len);
+    if (!g_host) w.u8(g_copy_flag);
     Send(w);
 }
 
@@ -661,18 +666,6 @@ void ServeDiag(int fd) {
     close(fd);
 }
 
-// the first bytes of a connection say what it wants: a comparison, else (nothing, the guest waits) the saves
-void ServeTcp(int fd, bool share_saves) {
-    pollfd pfd{fd, POLLIN, 0};
-    uint32_t magic = 0;
-    if (poll(&pfd, 1, 150) > 0 && recv(fd, &magic, 4, MSG_PEEK) == 4 && magic == kDiagMagic) {
-        recv(fd, &magic, 4, 0);
-        ServeDiag(fd);
-    } else {
-        ServeSave(fd, share_saves);
-    }
-}
-
 const char* DiagClass(uint32_t addr) {
     if (addr >= mem::kStackBase) return "stacks";
     if (addr >= mem::kSystemBase) return "system";
@@ -803,6 +796,193 @@ void MaybeDiag(uint32_t f) {
     }
 }
 
+// ---- state copy. The two games differ already when a level starts (counters, where the heap put things, the camera), and
+// lockstep only keeps two games alike that began alike. So at each barrier the guest takes the host's pages of the
+// image's data, the heap and the console's physical memory that differ from its own. The host's game thread is parked
+// at its barrier meanwhile, the host's other threads are not, and the guest's own handles and kernel objects stay.
+constexpr uint32_t kStateMagic = 0x54534B4D;  // "MKST"
+constexpr uint32_t kStateMaxPages = 8192;
+constexpr uint32_t kStampWord = 0x4A424F4B;   // kernel/objects.cpp's mark in the header of a dispatcher object the host tracks
+constexpr int kStateWaitMs = 40000;
+constexpr DiagRange kStateRanges[] = {{kImageLo, 0x20000000}, {mem::kContiguousBase, mem::kContiguousBase + mem::kPhysicalSize}};
+
+bool StateIncluded(uint32_t addr) {
+    for (const DiagRange& r : kStateRanges)
+        if (addr >= r.lo && addr < r.hi) return true;
+    return false;
+}
+
+// page number and hash of each committed page that is not all zero
+std::vector<uint32_t> StateTable() {
+    std::vector<uint32_t> t;
+    for (const DiagRange& r : kStateRanges)
+        for (uint64_t a = r.lo; a < r.hi; a += mem::kPage) {
+            if (!mem::IsCommitted(uint32_t(a))) continue;
+            const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(uint32_t(a)));
+            if (std::memcmp(p, ZeroPage(), mem::kPage) == 0) continue;
+            t.push_back(uint32_t(a >> 12));
+            t.push_back(HashBytes(p, mem::kPage));
+        }
+    return t;
+}
+
+// the host's side: the table of its pages, then the pages the guest asks for
+void ServeState(int fd) {
+    SetTimeouts(fd, 20);
+    uint32_t epoch = 0;
+    bool ok = RecvAll(fd, &epoch, 4);
+    std::vector<uint32_t> table;
+    if (ok) table = StateTable();
+    uint32_t head[3] = {kStateMagic, 0, uint32_t(table.size() / 2)};
+    ok = ok && SendAll(fd, head, 12) && SendAll(fd, table.data(), table.size() * 4);
+    uint32_t m = 0;
+    ok = ok && RecvAll(fd, &m, 4) && m <= kStateMaxPages;
+    std::vector<uint32_t> want(ok ? m : 0);
+    ok = ok && RecvAll(fd, want.data(), size_t(m) * 4);
+    for (uint32_t i = 0; ok && i < m; i++) {
+        uint32_t a = want[i] << 12;
+        const uint8_t* p = StateIncluded(a) && mem::IsCommitted(a) ? static_cast<const uint8_t*>(kernel::HostPtr(a)) : ZeroPage();
+        ok = SendAll(fd, p, mem::kPage);
+    }
+    close(fd);
+    LOGR("netplay: state copy served: %s (%zu pages known, %u sent)", ok ? "done" : "failed", table.size() / 2, m);
+    std::lock_guard lock(g_mtx);
+    g_state_copied_epoch = epoch;
+    g_cv.notify_all();
+}
+
+struct StateStats {
+    uint64_t written = 0, handles = 0, stamped = 0;
+};
+
+// the host's page over the guest's, word by word, but not a word that is a live handle of this phone or part of the
+// header of one of its dispatcher objects: those mean something only to this phone
+void ApplyStatePage(uint32_t addr, const uint8_t* host, StateStats& st) {
+    uint8_t* g = static_cast<uint8_t*>(kernel::HostPtr(addr));
+    uint32_t gw[1024], hw[1024];
+    bool keep[1024] = {};
+    std::memcpy(gw, g, mem::kPage);
+    std::memcpy(hw, host, mem::kPage);
+    for (uint32_t i = 3; i < 1024; i++)
+        if (gw[i] == kStampWord)
+            for (uint32_t k = i - 3; k <= i; k++) keep[k] = true;
+    for (uint32_t i = 0; i < 1024; i++) {
+        if (gw[i] == hw[i]) continue;
+        if (keep[i]) {
+            st.stamped++;
+            continue;
+        }
+        uint32_t v = gw[i];
+        if ((v & 3) == 0 && v >= 0x1000 && v < 0x100000 && kernel::FromHandle(v)) {
+            st.handles++;
+            continue;
+        }
+        std::memcpy(g + i * 4, &hw[i], 4);
+        st.written++;
+    }
+}
+
+int ConnectTcp(const sockaddr_in& host) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return -1;
+    fcntl(s, F_SETFL, fcntl(s, F_GETFL) | O_NONBLOCK);
+    sockaddr_in a = host;
+    connect(s, reinterpret_cast<sockaddr*>(&a), sizeof a);
+    pollfd pfd{s, POLLOUT, 0};
+    int err = 0;
+    socklen_t el = sizeof err;
+    if (poll(&pfd, 1, 5000) <= 0 || getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &el) != 0 || err) {
+        close(s);
+        return -1;
+    }
+    fcntl(s, F_SETFL, fcntl(s, F_GETFL) & ~O_NONBLOCK);
+    SetTimeouts(s, 20);
+    return s;
+}
+
+// the guest's side, on the game thread at its barrier. false if the copy did not happen (nothing was changed then,
+// or only some pages were)
+bool FetchState(uint32_t epoch, const sockaddr_in& host) {
+    auto t0 = Clock::now();
+    static const uint32_t kZeroHash = HashBytes(ZeroPage(), mem::kPage);
+    int fd = ConnectTcp(host);
+    if (fd < 0) {
+        LOGR("netplay: state copy failed: the host did not answer");
+        return false;
+    }
+    uint32_t req[2] = {kStateMagic, epoch}, head[3] = {};
+    if (!SendAll(fd, req, 8) || !RecvAll(fd, head, 12) || head[0] != kStateMagic || head[2] > (1u << 20)) {
+        close(fd);
+        LOGR("netplay: state copy failed: no table from the host");
+        return false;
+    }
+    std::vector<uint32_t> table(size_t(head[2]) * 2);
+    if (!RecvAll(fd, table.data(), table.size() * 4)) {
+        close(fd);
+        LOGR("netplay: state copy failed: the host's table broke");
+        return false;
+    }
+    const std::vector<uint32_t> mine = StateTable();
+    const size_t n = table.size() / 2, mn = mine.size() / 2;
+    std::vector<uint32_t> want;
+    uint32_t uncommitted = 0, differ = 0;
+    size_t i = 0, j = 0;
+    while (i < n || j < mn) {
+        uint32_t hp = i < n ? table[i * 2] : UINT32_MAX, mp = j < mn ? mine[j * 2] : UINT32_MAX, page = 0;
+        bool differs = false;
+        if (hp == mp) {
+            differs = table[i * 2 + 1] != mine[j * 2 + 1];
+            page = hp;
+            i++;
+            j++;
+        } else if (hp < mp) {
+            differs = table[i * 2 + 1] != kZeroHash;  // here it is zero, or not committed
+            page = hp;
+            i++;
+        } else {
+            differs = true;  // the host's is zero
+            page = mp;
+            j++;
+        }
+        if (!differs) continue;
+        differ++;
+        if (!mem::IsCommitted(page << 12)) {
+            uncommitted++;
+            continue;
+        }
+        if (want.size() < kStateMaxPages) want.push_back(page);
+    }
+    uint32_t m = uint32_t(want.size());
+    std::vector<uint8_t> pages(size_t(m) * mem::kPage);
+    bool ok = SendAll(fd, &m, 4) && SendAll(fd, want.data(), size_t(m) * 4) && RecvAll(fd, pages.data(), pages.size());
+    close(fd);
+    if (!ok) {
+        LOGR("netplay: state copy failed: the pages did not arrive, nothing changed");
+        return false;
+    }
+    StateStats st;
+    for (uint32_t k = 0; k < m; k++) ApplyStatePage(want[k] << 12, &pages[size_t(k) * mem::kPage], st);
+    LOGR("netplay: state copy done in %lld ms: %u of the host's %zu pages differed (%u not committed here), %u taken, "
+         "%llu words written, %llu kept as handles, %llu kept in kernel objects",
+         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count()), differ, n,
+         uncommitted, m, static_cast<unsigned long long>(st.written), static_cast<unsigned long long>(st.handles),
+         static_cast<unsigned long long>(st.stamped));
+    return true;
+}
+
+// the first bytes of a connection say what it wants: a comparison or a state copy, else (nothing, the guest waits) the saves
+void ServeTcp(int fd, bool share_saves) {
+    pollfd pfd{fd, POLLIN, 0};
+    uint32_t magic = 0;
+    if (poll(&pfd, 1, 150) > 0 && recv(fd, &magic, 4, MSG_PEEK) == 4 && (magic == kDiagMagic || magic == kStateMagic)) {
+        recv(fd, &magic, 4, 0);
+        if (magic == kDiagMagic) ServeDiag(fd);
+        else ServeState(fd);
+    } else {
+        ServeSave(fd, share_saves);
+    }
+}
+
 // ---- packets, g_mtx held
 void OnInput(Reader& r, const Header& h) {
     if (h.epoch > g_peer_epoch) g_peer_epoch = h.epoch;
@@ -856,6 +1036,10 @@ void OnSync(Reader& r, const Header& h) {
                 g_payload.assign(r.p, r.p + len);
                 g_sync_got = true;
             }
+        } else {
+            r.u16();
+            uint8_t flag = r.u8();
+            if (r.ok) g_peer_copy = flag == 1;
         }
         // the guest keeps asking until it has the payload: the host answers each time, even past its own barrier
         if (g_host) SendSync();
@@ -1321,6 +1505,8 @@ bool Barrier(std::unique_lock<std::mutex>& lk) {
     auto begin = [] {
         g_epoch = std::max(g_epoch + 1, g_peer_epoch);
         g_peer_here = g_sync_got = false;
+        g_peer_copy = false;
+        g_copy_flag = !g_host && game::Opt().netplay_state_copy ? 1 : 0;
         g_frame = 0;
         g_local_next = g_remote_next = g_remote_ack = g_delay;
         for (uint32_t i = 0; i < g_delay; i++) g_local[i] = g_remote[i] = WirePad{};
@@ -1341,10 +1527,34 @@ bool Barrier(std::unique_lock<std::mutex>& lk) {
     begin();
     LOGR("netplay: epoch %u: waiting for the friend to reach gameplay", g_epoch);
     SendSync();
+    Clock::time_point copy_since{};
     for (;;) {
         if (g_state.load() == State::Off) return false;
         if (g_peer_epoch > g_epoch) begin();
-        if (g_peer_here && (g_host || g_sync_got)) break;
+        if (g_peer_here && (g_host || g_sync_got)) {
+            if (g_host) {
+                // the guest takes the host's pages first: the host's game stays where it is until then
+                if (g_peer_copy && g_state_copied_epoch != g_epoch) {
+                    if (copy_since == Clock::time_point{}) copy_since = Clock::now();
+                    if (Clock::now() - copy_since < std::chrono::milliseconds(kStateWaitMs)) {
+                        g_cv.wait_for(lk, std::chrono::milliseconds(20));
+                        continue;
+                    }
+                    LOGR("netplay: the friend's state copy did not finish, going on");
+                }
+            } else if (g_copy_flag == 1) {
+                const uint32_t epoch = g_epoch;
+                const sockaddr_in host = g_peer;
+                lk.unlock();
+                FetchState(epoch, host);
+                lk.lock();
+                g_copy_flag = 2;
+                SendSync();
+                if (g_state.load() == State::Off) return false;
+                if (g_peer_epoch > g_epoch) continue;
+            }
+            break;
+        }
         g_cv.wait_for(lk, std::chrono::milliseconds(20));
     }
     if (!g_host) ApplyPayload();
